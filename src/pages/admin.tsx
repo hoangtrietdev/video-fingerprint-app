@@ -249,25 +249,6 @@ export default function AdminPage() {
                 </>
               )}
             </div>
-
-            <label className="flex items-center gap-2 text-sm text-slate-400 cursor-pointer select-none">
-              <span>Auto-scroll</span>
-              <button
-                id="btn-autoscroll-toggle"
-                role="switch"
-                aria-checked={autoScroll}
-                onClick={() => setAutoScroll((v) => !v)}
-                className={`relative w-10 h-5 rounded-full transition-colors duration-200 ${
-                  autoScroll ? "bg-indigo-500" : "bg-slate-700"
-                }`}
-              >
-                <span
-                  className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform duration-200 ${
-                    autoScroll ? "translate-x-5" : "translate-x-0.5"
-                  }`}
-                />
-              </button>
-            </label>
           </div>
 
           {/* ── Fingerprint table ─────────────────────────────────────────────── */}
