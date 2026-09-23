@@ -9,7 +9,7 @@ that it has not been modified, cut or forged.
 | **Encoder / Transmitter** | driver's smartphone (mobile web app) | `/` | [docs/ENCODER.md](docs/ENCODER.md) |
 | **Decoder** | insurer's computer (web app) | `/admin` | [docs/DECODER.md](docs/DECODER.md) |
 | Installation / configuration / run (both) | | | [docs/SETUP.md](docs/SETUP.md) |
-| Demo video script (both) | | | [docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md) |
+
 
 ## Quick start
 
