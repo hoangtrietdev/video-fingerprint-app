@@ -1,0 +1,207 @@
+/**
+ * src/utils/validation.ts
+ *
+ * Validation and file-parsing utilities for the Video Fingerprint System.
+ *
+ * These pure functions are shared between the Driver and Admin pages to ensure
+ * the same validation rules are applied consistently on both sides:
+ *
+ *   • Driver page  – validates each hash *before* inserting it, preventing
+ *                    invalid data from ever reaching the database.
+ *   • Admin page   – re-validates each hash *after* it arrives via Realtime
+ *                    to catch any data that bypassed the client (e.g., direct
+ *                    API calls), fulfilling the "Data Integrity" requirement.
+ */
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/** Expected character length of a SHA-256 hex digest. */
+export const SHA256_HEX_LENGTH = 64;
+
+/**
+ * RegExp that matches a valid lower-case hexadecimal string.
+ * Anchored at both ends (^ and $) to prevent partial matches.
+ * Compiled once and reused for performance across large batches.
+ */
+const HEX_PATTERN = /^[0-9a-f]{64}$/;
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Result of parsing a `.txt` fingerprint file.
+ */
+export interface ParseResult {
+  /** Successfully parsed, non-empty hash lines. */
+  hashes: string[];
+  /** Lines that were skipped (blank) or malformed, with their line numbers. */
+  skippedLines: Array<{ lineNumber: number; raw: string; reason: string }>;
+}
+
+/**
+ * Result of validating a single hash string.
+ */
+export interface ValidationResult {
+  isValid: boolean;
+  /** Human-readable reason for failure, undefined when isValid is true. */
+  reason?: string;
+}
+
+// ── Functions ─────────────────────────────────────────────────────────────────
+
+/**
+ * Validates whether a string is a properly formatted SHA-256 hex digest.
+ *
+ * Rules (matching the database CHECK constraint exactly):
+ *  1. Must be exactly 64 characters long.
+ *  2. Must contain only lowercase hexadecimal characters (0-9, a-f).
+ *
+ * Normalising to lowercase first handles the common case where hashes are
+ * produced by tools that output uppercase hex (e.g., `sha256sum` on Linux).
+ *
+ * @param raw - The raw string to validate.
+ * @returns ValidationResult with `isValid` flag and optional failure reason.
+ */
+export function validateSha256Hash(raw: string): ValidationResult {
+  const normalised = raw.trim().toLowerCase();
+
+  if (normalised.length === 0) {
+    return { isValid: false, reason: "Empty string" };
+  }
+
+  if (normalised.length !== SHA256_HEX_LENGTH) {
+    return {
+      isValid: false,
+      reason: `Expected ${SHA256_HEX_LENGTH} characters, got ${normalised.length}`,
+    };
+  }
+
+  if (!HEX_PATTERN.test(normalised)) {
+    return {
+      isValid: false,
+      reason: "Contains non-hexadecimal characters",
+    };
+  }
+
+  return { isValid: true };
+}
+
+/**
+ * Parses the raw text content of a `.txt` fingerprint file.
+ *
+ * The expected file format is one SHA-256 hash per line, e.g.:
+ *   a3f1c2...  (64 hex chars)
+ *   9b04de...
+ *   ...
+ *
+ * Processing steps:
+ *  1. Split on any newline convention (CRLF, LF, CR).
+ *  2. Trim whitespace from each line.
+ *  3. Skip completely blank lines silently.
+ *  4. Normalise to lowercase.
+ *  5. Validate format; record skipped/malformed lines for the UI.
+ *
+ * @param fileContent - Raw UTF-8 string content of the uploaded file.
+ * @returns ParseResult with valid hashes and a report of skipped lines.
+ */
+export function parseFingerprintFile(fileContent: string): ParseResult {
+  const lines = fileContent.split(/\r\n|\r|\n/);
+  const hashes: string[] = [];
+  const skippedLines: ParseResult["skippedLines"] = [];
+
+  lines.forEach((line, index) => {
+    const trimmed = line.trim();
+
+    // Silently skip blank lines — they are common at end-of-file.
+    if (trimmed.length === 0) return;
+
+    const normalised = trimmed.toLowerCase();
+    const { isValid, reason } = validateSha256Hash(normalised);
+
+    if (isValid) {
+      hashes.push(normalised);
+    } else {
+      skippedLines.push({
+        lineNumber: index + 1,
+        raw: trimmed.length > 20 ? `${trimmed.slice(0, 20)}…` : trimmed,
+        reason: reason ?? "Unknown validation error",
+      });
+    }
+  });
+
+  return { hashes, skippedLines };
+}
+
+/**
+ * Reads a File object as a UTF-8 string using the browser's FileReader API.
+ * Wraps the callback-based API in a Promise for clean async/await usage.
+ *
+ * @param file - The File object from an <input type="file"> element.
+ * @returns A Promise that resolves to the file's text content.
+ */
+export function readFileAsText(file: File): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const result = event.target?.result;
+      if (typeof result === "string") {
+        resolve(result);
+      } else {
+        reject(new Error("FileReader did not return a string result."));
+      }
+    };
+    reader.onerror = () =>
+      reject(new Error(`FileReader error: ${reader.error?.message ?? "unknown"}`));
+    reader.readAsText(file, "UTF-8");
+  });
+}
+
+/**
+ * Generates a simulated video-frame Unix timestamp (milliseconds) for a
+ * given frame index, starting from "now" when streaming begins.
+ *
+ * In a real dashcam system this would be the actual capture time embedded
+ * in the video container metadata. For the PoC, we simulate 30 fps (one
+ * frame every ~33 ms) relative to a provided start time.
+ *
+ * @param startTimeMs  - The Unix timestamp (ms) when streaming started.
+ * @param frameIndex   - Zero-based index of the current frame in the sequence.
+ * @param fpsSimulated - Frames per second to simulate (default 30).
+ * @returns Simulated capture timestamp in milliseconds.
+ */
+export function simulateFrameTimestamp(
+  startTimeMs: number,
+  frameIndex: number,
+  fpsSimulated: number = 30
+): number {
+  const msPerFrame = 1000 / fpsSimulated;
+  return Math.round(startTimeMs + frameIndex * msPerFrame);
+}
+
+/**
+ * Returns a human-readable elapsed-time string from a start timestamp.
+ * Used by the driver UI to show how long streaming has been running.
+ *
+ * @param startMs - Unix timestamp (ms) when streaming began.
+ * @returns String in "Xm Ys" format (e.g. "2m 34s").
+ */
+export function formatElapsedTime(startMs: number): string {
+  const elapsedSec = Math.floor((Date.now() - startMs) / 1000);
+  const minutes = Math.floor(elapsedSec / 60);
+  const seconds = elapsedSec % 60;
+  return `${minutes}m ${seconds}s`;
+}
+
+/**
+ * Computes a SHA-256 hash of a string using the Web Crypto API.
+ * This is used to hash base64 encoded video frames.
+ *
+ * @param message The string to hash (e.g., base64 image data)
+ * @returns A Promise resolving to the hex-encoded SHA-256 hash string
+ */
+export async function hashString(message: string): Promise<string> {
+  const msgUint8 = new TextEncoder().encode(message);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", msgUint8);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  const hashHex = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+  return hashHex;
+}

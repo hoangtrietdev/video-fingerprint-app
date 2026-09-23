@@ -1,0 +1,410 @@
+/**
+ * src/pages/index.tsx — Driver / Dashcam Unit Interface
+ *
+ * This page acts as the in-vehicle dashcam software:
+ *  1. Captures live video from the device's camera.
+ *  2. Periodically extracts frames and hashes them using SHA-256.
+ *  3. Transmits the hashes to the Supabase cloud in real-time.
+ *  4. Handles network interruptions by buffering hashes offline and
+ *     transmitting them in bulk upon reconnection.
+ *  5. Automatically cleans up old, transmitted hashes.
+ */
+
+import Head from "next/head";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { insertFingerprint } from "@/lib/supabaseClient";
+import { formatElapsedTime, hashString } from "@/utils/validation";
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+type StreamStatus = "idle" | "streaming" | "offline_buffering" | "error";
+
+interface HashRecord {
+  id: string; // local temp id
+  hash: string;
+  frame_timestamp: number;
+  transmitted: boolean;
+}
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const FRAME_CAPTURE_INTERVAL_MS = 1000; // 1 frame per second
+const MAX_BUFFER_AGE_MS = 30 * 60 * 1000; // 30 minutes cleanup
+
+// ── Component ─────────────────────────────────────────────────────────────────
+
+export default function DriverPage() {
+  const [status, setStatus] = useState<StreamStatus>("idle");
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [startTimeMs, setStartTimeMs] = useState<number | null>(null);
+  const [stats, setStats] = useState({ captured: 0, transmitted: 0, buffered: 0 });
+  const [lastHash, setLastHash] = useState<string>("");
+
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const captureIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  
+  // Local buffer of hashes
+  const bufferRef = useRef<HashRecord[]>([]);
+
+  // ── Network State ───────────────────────────────────────────────────────────
+  const [isOnline, setIsOnline] = useState<boolean>(true);
+
+  useEffect(() => {
+    // Initial state
+    setIsOnline(navigator.onLine);
+
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
+
+  // Update status based on network
+  useEffect(() => {
+    if (status === "streaming" && !isOnline) {
+      setStatus("offline_buffering");
+    } else if (status === "offline_buffering" && isOnline) {
+      setStatus("streaming");
+      flushBuffer();
+    }
+  }, [isOnline, status]);
+
+  // ── Streaming Logic ─────────────────────────────────────────────────────────
+
+  const flushBuffer = async () => {
+    const pending = bufferRef.current.filter((r) => !r.transmitted);
+    if (pending.length === 0) return;
+
+    for (const record of pending) {
+      if (!isOnline) break; // stop if we go offline again
+
+      const { error } = await insertFingerprint({
+        hash: record.hash,
+        frame_timestamp: record.frame_timestamp,
+      });
+
+      if (error) {
+        console.error("Failed to transmit buffered hash:", error);
+        break;
+      } else {
+        record.transmitted = true;
+        setStats((prev) => ({
+          ...prev,
+          transmitted: prev.transmitted + 1,
+          buffered: prev.buffered - 1,
+        }));
+      }
+    }
+    
+    cleanUpOldBuffer();
+  };
+
+  const cleanUpOldBuffer = () => {
+    const now = Date.now();
+    bufferRef.current = bufferRef.current.filter(
+      (r) => !r.transmitted || (now - r.frame_timestamp) < MAX_BUFFER_AGE_MS
+    );
+  };
+
+  const captureFrame = async () => {
+    if (!videoRef.current || !canvasRef.current) return;
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext("2d");
+
+    if (!ctx || video.videoWidth === 0) return;
+
+    // Set canvas dimensions to match video
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+
+    // Draw video frame to canvas
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    // Extract base64 image data (JPEG for smaller size)
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.7);
+
+    // Compute SHA-256 hash
+    const hash = await hashString(dataUrl);
+    const timestamp = Date.now();
+    setLastHash(hash);
+
+    const record: HashRecord = {
+      id: Math.random().toString(36).substr(2, 9),
+      hash,
+      frame_timestamp: timestamp,
+      transmitted: false,
+    };
+
+    bufferRef.current.push(record);
+    setStats((prev) => ({ ...prev, captured: prev.captured + 1, buffered: prev.buffered + 1 }));
+
+    // If online, attempt to transmit immediately
+    if (isOnline) {
+      const { error } = await insertFingerprint({
+        hash,
+        frame_timestamp: timestamp,
+      });
+
+      if (!error) {
+        record.transmitted = true;
+        setStats((prev) => ({
+          ...prev,
+          transmitted: prev.transmitted + 1,
+          buffered: prev.buffered - 1,
+        }));
+      } else {
+        console.error("Insert failed:", error);
+      }
+    }
+  };
+
+  const startStreaming = async () => {
+    setErrorMessage(null);
+    try {
+      const mediaStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment" }, // prefer rear camera
+        audio: false,
+      });
+      streamRef.current = mediaStream;
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = mediaStream;
+      }
+
+      setStartTimeMs(Date.now());
+      setStatus(isOnline ? "streaming" : "offline_buffering");
+      setStats({ captured: 0, transmitted: 0, buffered: 0 });
+      bufferRef.current = [];
+
+      captureIntervalRef.current = setInterval(captureFrame, FRAME_CAPTURE_INTERVAL_MS);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : "Failed to access camera");
+      setStatus("error");
+    }
+  };
+
+  const stopStreaming = useCallback(() => {
+    if (captureIntervalRef.current) {
+      clearInterval(captureIntervalRef.current);
+      captureIntervalRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+    setStatus("idle");
+    setStartTimeMs(null);
+  }, []);
+
+  // Clean up on unmount
+  useEffect(() => {
+    return () => {
+      stopStreaming();
+    };
+  }, [stopStreaming]);
+
+  // ── Derived UI values ───────────────────────────────────────────────────────
+
+  const elapsed = startTimeMs !== null ? formatElapsedTime(startTimeMs) : "—";
+  const isRecording = status === "streaming" || status === "offline_buffering";
+
+  // ── Render ──────────────────────────────────────────────────────────────────
+
+  return (
+    <>
+      <Head>
+        <title>Driver Unit — Video Fingerprint System</title>
+        <meta name="description" content="Dashcam that streams video fingerprints to the cloud." />
+      </Head>
+
+      <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white font-sans">
+        <nav className="border-b border-slate-700/50 bg-slate-900/70 backdrop-blur-md sticky top-0 z-10">
+          <div className="max-w-5xl mx-auto px-6 h-16 flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <span className="text-2xl">🎥</span>
+              <div>
+                <p className="text-xs text-slate-400 font-medium uppercase tracking-widest">
+                  Cloud Fingerprint System
+                </p>
+                <h1 className="text-sm font-bold text-white leading-tight">
+                  Driver / Dashcam Unit
+                </h1>
+              </div>
+            </div>
+            <a
+              href="/admin"
+              className="flex items-center gap-2 text-sm text-slate-400 hover:text-white transition-colors duration-200 group"
+            >
+              <span>Admin Dashboard</span>
+              <span className="group-hover:translate-x-1 transition-transform duration-200">
+                →
+              </span>
+            </a>
+          </div>
+        </nav>
+
+        <main className="max-w-5xl mx-auto px-6 py-12 space-y-8">
+          <StatusBadge status={status} isOnline={isOnline} />
+
+          <section className="bg-slate-800/60 border border-slate-700/50 rounded-2xl p-8 backdrop-blur-sm">
+            <h2 className="text-lg font-semibold text-white mb-1">
+              Live Dashcam Feed
+            </h2>
+            <p className="text-sm text-slate-400 mb-6">
+              Video frames are locally hashed (SHA-256) and transmitted in real-time.
+            </p>
+
+            {/* Video preview container */}
+            <div className="relative w-full aspect-video bg-black rounded-xl overflow-hidden mb-6 border border-slate-700">
+              <video
+                ref={videoRef}
+                autoPlay
+                playsInline
+                muted
+                className="w-full h-full object-cover"
+              />
+              {!isRecording && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+                  <p className="text-slate-400">Camera is inactive</p>
+                </div>
+              )}
+              {isRecording && (
+                <div className="absolute top-4 right-4 flex items-center gap-2 px-3 py-1 bg-black/50 rounded-full border border-slate-600/50 backdrop-blur-md">
+                  <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                  <span className="text-xs font-medium tracking-wide">REC</span>
+                </div>
+              )}
+            </div>
+
+            {/* Hidden canvas for frame extraction */}
+            <canvas ref={canvasRef} className="hidden" />
+
+            <div className="flex flex-wrap gap-3 mb-8">
+              {!isRecording ? (
+                <>
+                  <button
+                    onClick={startStreaming}
+                    className="px-6 py-3 rounded-xl font-semibold text-sm bg-emerald-500 hover:bg-emerald-400 text-white transition-all shadow-lg shadow-emerald-500/20"
+                  >
+                    ▶ Start Dashcam
+                  </button>
+                  {stats.captured > 0 && (
+                    <a
+                      href="/admin"
+                      className="px-6 py-3 rounded-xl font-semibold text-sm bg-indigo-500 hover:bg-indigo-400 text-white transition-all shadow-lg shadow-indigo-500/20 flex items-center gap-2"
+                    >
+                      🛡️ View Admin Dashboard <span>→</span>
+                    </a>
+                  )}
+                </>
+              ) : (
+                <button
+                  onClick={stopStreaming}
+                  className="px-6 py-3 rounded-xl font-semibold text-sm bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-500/30 transition-all"
+                >
+                  ■ Stop Dashcam
+                </button>
+              )}
+            </div>
+
+            {errorMessage && (
+              <div className="mt-4 p-4 rounded-lg bg-red-500/10 border border-red-500/30">
+                <p className="text-sm text-red-400 font-medium">⚠ {errorMessage}</p>
+              </div>
+            )}
+
+            {isRecording && (
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-6">
+                <StatCard label="Frames Captured" value={stats.captured} color="emerald" icon="📸" />
+                <StatCard label="Transmitted" value={stats.transmitted} color="sky" icon="☁️" />
+                <StatCard label="Offline Buffer" value={stats.buffered} color={stats.buffered > 0 ? "amber" : "slate"} icon="📦" />
+                <StatCard label="Elapsed Time" value={elapsed} color="indigo" icon="⏱️" />
+              </div>
+            )}
+
+            {isRecording && lastHash && (
+              <div className="mt-6 p-4 rounded-lg bg-slate-900/60 border border-slate-700">
+                <p className="text-xs text-slate-500 mb-1">Latest SHA-256 Hash</p>
+                <p className="text-xs font-mono text-emerald-400 break-all">{lastHash}</p>
+              </div>
+            )}
+          </section>
+        </main>
+      </div>
+    </>
+  );
+}
+
+// ── Sub-components ─────────────────────────────────────────────────────────────
+
+function StatusBadge({ status, isOnline }: { status: StreamStatus; isOnline: boolean }) {
+  const map: Record<StreamStatus, { label: string; classes: string; dot: string }> = {
+    idle: {
+      label: "Ready",
+      classes: "bg-slate-700/50 text-slate-400 border-slate-600",
+      dot: "bg-slate-400",
+    },
+    streaming: {
+      label: "Transmitting Live",
+      classes: "bg-emerald-500/10 text-emerald-400 border-emerald-500/30",
+      dot: "bg-emerald-400 animate-pulse",
+    },
+    offline_buffering: {
+      label: "Offline (Buffering)",
+      classes: "bg-amber-500/10 text-amber-400 border-amber-500/30",
+      dot: "bg-amber-400 animate-pulse",
+    },
+    error: {
+      label: "Error",
+      classes: "bg-red-500/10 text-red-400 border-red-500/30",
+      dot: "bg-red-400",
+    },
+  };
+
+  const info = map[status];
+
+  return (
+    <div className="flex items-center gap-3">
+      <div className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-full border text-xs font-medium ${info.classes}`}>
+        <span className={`w-2 h-2 rounded-full ${info.dot}`} />
+        {info.label}
+      </div>
+      {!isOnline && (
+        <span className="text-xs text-red-400 font-medium bg-red-950/50 px-2 py-1 rounded border border-red-900/50">
+          No Internet Connection
+        </span>
+      )}
+    </div>
+  );
+}
+
+function StatCard({ label, value, color, icon }: { label: string; value: string | number; color: "emerald" | "amber" | "sky" | "slate" | "indigo"; icon: string }) {
+  const colorMap = {
+    emerald: "text-emerald-400",
+    amber: "text-amber-400",
+    sky: "text-sky-400",
+    slate: "text-slate-400",
+    indigo: "text-indigo-400",
+  };
+  return (
+    <div className="bg-slate-900/60 border border-slate-700 rounded-xl p-4">
+      <p className="text-xs text-slate-500 mb-1 flex items-center gap-1.5">
+        <span>{icon}</span>
+        {label}
+      </p>
+      <p className={`text-2xl font-bold font-mono ${colorMap[color]}`}>{value}</p>
+    </div>
+  );
+}

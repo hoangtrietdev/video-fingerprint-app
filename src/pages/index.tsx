@@ -1,505 +1,488 @@
 /**
- * src/pages/index.tsx — Driver / Dashcam Unit Interface
+ * src/pages/index.tsx — ENCODER / TRANSMITTER (driver smartphone)
  *
- * This page simulates the in-vehicle software that:
- *  1. Accepts a .txt file containing SHA-256 frame hashes.
- *  2. Parses and validates the file content in the browser (no server round-trip).
- *  3. Streams each hash to the Supabase `fingerprints` table one-by-one with a
- *     configurable delay, simulating a live 30-fps dashcam feed compressed into
- *     a 500 ms per-insert transmission rate.
- *
- * Real-Time Transmission guarantee:
- *  Each insert is awaited sequentially so that order is guaranteed and the UI
- *  progress indicator reflects the true number of committed records rather than
- *  optimistic local counts.
- *
- * Data Integrity guarantee:
- *  Every hash is validated against the SHA-256 format before being sent.
- *  Invalid hashes are skipped and surfaced in the "Parse Report" section,
- *  ensuring only cryptographically valid fingerprints enter the database.
+ * UI around the recording engine (lib/recorder.ts), the store-and-forward
+ * transmitter (lib/transmitter.ts) and the loop-recording retention
+ * (lib/retention.ts). See docs/ENCODER.md for the full description.
  */
 
 import Head from "next/head";
-import { ChangeEvent, useCallback, useRef, useState } from "react";
-import { insertFingerprint } from "@/lib/supabaseClient";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Badge, Button, Card, ConfigWarning, Stat, TopNav } from "@/components/ui";
 import {
-  formatElapsedTime,
-  parseFingerprintFile,
-  ParseResult,
-  readFileAsText,
-  simulateFrameTimestamp,
-} from "@/utils/validation";
+  DEFAULT_RETENTION_MS,
+  DEFAULT_SEGMENT_MS,
+  INCIDENT_LOCK_AFTER_MS,
+  INCIDENT_LOCK_BEFORE_MS,
+  RETENTION_OPTIONS_MS,
+  SEGMENT_OPTIONS_MS,
+} from "@/lib/config";
+import { DeviceIdentity, loadOrCreateIdentity } from "@/lib/deviceIdentity";
+import type { SegmentRecord } from "@/lib/integrity";
+import { clearRecordings, listSegments, LocalSegment } from "@/lib/localStore";
+import { DashcamRecorder } from "@/lib/recorder";
+import { uploadEvidence } from "@/lib/repository";
+import { applyRetention, lockRange, setLocked } from "@/lib/retention";
+import { supabaseConfigured } from "@/lib/supabaseClient";
+import { HashTransmitter, LinkState } from "@/lib/transmitter";
+import { downloadBlob, formatBytes, formatClock, formatElapsed, short } from "@/utils/format";
 
-// ── Types ─────────────────────────────────────────────────────────────────────
-
-type StreamStatus = "idle" | "streaming" | "done" | "error";
-
-interface StreamState {
-  status: StreamStatus;
-  sent: number;
-  total: number;
-  lastHash: string;
-  errorMessage: string | null;
-  startTimeMs: number | null;
+type RecState = "idle" | "starting" | "recording" | "stopping" | "error";
+interface LogLine {
+  t: number;
+  msg: string;
+  level: "info" | "warn" | "error";
 }
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+export default function EncoderPage() {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const recorderRef = useRef<DashcamRecorder | null>(null);
+  const txRef = useRef<HashTransmitter | null>(null);
+  const lockUntilRef = useRef(0);
+  const retentionRef = useRef(DEFAULT_RETENTION_MS);
 
-/** Delay between consecutive inserts in milliseconds. Adjust to taste. */
-const STREAM_DELAY_MS = 500;
+  const [identity, setIdentity] = useState<DeviceIdentity | null>(null);
+  const [initError, setInitError] = useState<string | null>(null);
+  const [rec, setRec] = useState<RecState>("idle");
+  const [error, setError] = useState<string | null>(null);
+  const [startedAt, setStartedAt] = useState<number | null>(null);
+  const [segmentMs, setSegmentMs] = useState<number>(DEFAULT_SEGMENT_MS);
+  const [retentionMs, setRetentionMs] = useState<number>(DEFAULT_RETENTION_MS);
+  const [link, setLink] = useState<LinkState>("online");
+  const [simOffline, setSimOffline] = useState(false);
+  const [pending, setPending] = useState(0);
+  const [rejected, setRejected] = useState(0);
+  const [segments, setSegments] = useState<LocalSegment[]>([]);
+  const [stats, setStats] = useState({ recorded: 0, sent: 0, purged: 0 });
+  const [last, setLast] = useState<SegmentRecord | null>(null);
+  const [logs, setLogs] = useState<LogLine[]>([]);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [preview, setPreview] = useState<{ url: string; name: string } | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const [storage, setStorage] = useState<{ usage: number; quota: number } | null>(null);
 
-// ── Component ─────────────────────────────────────────────────────────────────
-
-export default function DriverPage() {
-  const [parseResult, setParseResult] = useState<ParseResult | null>(null);
-  const [fileName, setFileName] = useState<string>("");
-  const [stream, setStream] = useState<StreamState>({
-    status: "idle",
-    sent: 0,
-    total: 0,
-    lastHash: "",
-    errorMessage: null,
-    startTimeMs: null,
-  });
-
-  // Ref used to signal mid-stream cancellation without causing a state race.
-  const cancelRef = useRef<boolean>(false);
-
-  // ── File handling ───────────────────────────────────────────────────────────
-
-  const handleFileChange = useCallback(
-    async (e: ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (!file) return;
-
-      // Reset streaming state when a new file is loaded.
-      cancelRef.current = false;
-      setStream({
-        status: "idle",
-        sent: 0,
-        total: 0,
-        lastHash: "",
-        errorMessage: null,
-        startTimeMs: null,
-      });
-      setFileName(file.name);
-
-      try {
-        const content = await readFileAsText(file);
-        const result = parseFingerprintFile(content);
-        setParseResult(result);
-      } catch (err) {
-        setParseResult(null);
-        setStream((prev) => ({
-          ...prev,
-          status: "error",
-          errorMessage:
-            err instanceof Error ? err.message : "Failed to read file.",
-        }));
-      }
-    },
-    []
-  );
-
-  // ── Streaming logic ─────────────────────────────────────────────────────────
-
-  const handleStartStreaming = useCallback(async () => {
-    if (!parseResult || parseResult.hashes.length === 0) return;
-
-    cancelRef.current = false;
-    const startTimeMs = Date.now();
-
-    setStream({
-      status: "streaming",
-      sent: 0,
-      total: parseResult.hashes.length,
-      lastHash: "",
-      errorMessage: null,
-      startTimeMs,
-    });
-
-    for (let i = 0; i < parseResult.hashes.length; i++) {
-      // Check cancellation flag set by the Stop button.
-      if (cancelRef.current) {
-        setStream((prev) => ({ ...prev, status: "idle" }));
-        return;
-      }
-
-      const hash = parseResult.hashes[i];
-
-      // Simulate a realistic video-frame timestamp at 30 fps.
-      const frame_timestamp = simulateFrameTimestamp(startTimeMs, i);
-
-      // ── REAL-TIME TRANSMISSION ──────────────────────────────────────────────
-      // Each insert is sent individually and awaited. This creates the
-      // streaming behaviour visible on the admin dashboard — the insurance
-      // operator sees hashes appearing one-by-one in real-time, exactly as
-      // they would from a live dashcam feed.
-      const { error } = await insertFingerprint({ hash, frame_timestamp });
-
-      if (error) {
-        setStream((prev) => ({
-          ...prev,
-          status: "error",
-          errorMessage: `Insert failed at frame ${i + 1}: ${error.message}`,
-        }));
-        return;
-      }
-
-      setStream((prev) => ({
-        ...prev,
-        sent: i + 1,
-        lastHash: hash,
-      }));
-
-      // Throttle inserts to simulate a realistic transmission rate.
-      // In production this delay would be driven by the camera capture rate.
-      if (i < parseResult.hashes.length - 1) {
-        await delay(STREAM_DELAY_MS);
-      }
-    }
-
-    setStream((prev) => ({ ...prev, status: "done" }));
-  }, [parseResult]);
-
-  const handleStop = useCallback(() => {
-    cancelRef.current = true;
+  const log = useCallback((msg: string, level: LogLine["level"] = "info") => {
+    setLogs((l) => [{ t: Date.now(), msg, level }, ...l].slice(0, 200));
   }, []);
 
-  // ── Derived UI values ───────────────────────────────────────────────────────
+  const refreshSegments = useCallback(async () => {
+    setSegments(await listSegments());
+    try {
+      const e = await navigator.storage?.estimate?.();
+      if (e) setStorage({ usage: e.usage ?? 0, quota: e.quota ?? 0 });
+    } catch {
+      /* optional */
+    }
+  }, []);
 
-  const progressPercent =
-    stream.total > 0 ? Math.round((stream.sent / stream.total) * 100) : 0;
+  // ── Boot: identity, transmitter, stored segments ───────────────────────────
+  useEffect(() => {
+    let tx: HashTransmitter | null = null;
+    (async () => {
+      try {
+        const id = await loadOrCreateIdentity();
+        setIdentity(id);
+        tx = new HashTransmitter(id, {
+          onLinkState: setLink,
+          onQueueChange: (p, r) => {
+            setPending(p);
+            setRejected(r);
+          },
+          onSent: (rows) => {
+            setStats((s) => ({ ...s, sent: s.sent + rows.length }));
+            void refreshSegments();
+          },
+          onLog: log,
+        });
+        txRef.current = tx;
+        tx.start();
+        await refreshSegments();
+        void navigator.storage?.persist?.();
+      } catch (e) {
+        setInitError((e as Error).message);
+      }
+    })();
+    const tick = setInterval(() => setNow(Date.now()), 1000);
+    return () => {
+      clearInterval(tick);
+      tx?.stop();
+      void recorderRef.current?.stop();
+    };
+  }, [log, refreshSegments]);
 
-  const elapsed =
-    stream.startTimeMs !== null ? formatElapsedTime(stream.startTimeMs) : "—";
+  // ── Retention (loop recording) — runs every 5 s ────────────────────────────
+  useEffect(() => {
+    retentionRef.current = retentionMs;
+  }, [retentionMs]);
 
-  const canStream =
-    parseResult !== null &&
-    parseResult.hashes.length > 0 &&
-    stream.status !== "streaming";
+  useEffect(() => {
+    const t = setInterval(async () => {
+      const { deleted } = await applyRetention(retentionRef.current);
+      if (deleted.length) {
+        setStats((s) => ({ ...s, purged: s.purged + deleted.length }));
+        log(
+          `Retention: deleted ${deleted.length} expired segment(s) ${deleted
+            .map((d) => `#${d.record.seq}`)
+            .join(", ")} (older than ${retentionRef.current / 60000} min)`
+        );
+        await refreshSegments();
+      }
+    }, 5000);
+    return () => clearInterval(t);
+  }, [log, refreshSegments]);
 
-  // ── Render ──────────────────────────────────────────────────────────────────
+  // ── Recording control ──────────────────────────────────────────────────────
+  const start = async () => {
+    if (!identity || !videoRef.current || !canvasRef.current) return;
+    setError(null);
+    setRec("starting");
+    const r = new DashcamRecorder({
+      video: videoRef.current,
+      canvas: canvasRef.current,
+      identity,
+      segmentMs,
+      shouldLock: (s, e) => e <= lockUntilRef.current || s <= lockUntilRef.current,
+      onLog: log,
+      onSegment: (seg) => {
+        setLast(seg.record);
+        setStats((s) => ({ ...s, recorded: s.recorded + 1 }));
+        log(
+          `Segment #${seg.record.seq} closed: ${formatBytes(seg.blob.size)}, ${seg.record.frame_count} frames, SHA-256 ${short(
+            seg.record.segment_hash,
+            10
+          )}${seg.locked ? " 🔒" : ""}`
+        );
+        void txRef.current?.enqueue(seg.record);
+        void refreshSegments();
+      },
+    });
+    recorderRef.current = r;
+    try {
+      await r.start();
+      setStartedAt(Date.now());
+      setRec("recording");
+    } catch (e) {
+      recorderRef.current = null;
+      const msg = (e as Error).message;
+      setError(msg);
+      log(msg, "error");
+      setRec("error");
+    }
+  };
+
+  const stop = async () => {
+    setRec("stopping");
+    await recorderRef.current?.stop();
+    recorderRef.current = null;
+    setStartedAt(null);
+    setRec("idle");
+    await refreshSegments();
+  };
+
+  const incident = async () => {
+    const t = Date.now();
+    lockUntilRef.current = t + INCIDENT_LOCK_AFTER_MS;
+    const n = await lockRange(t - INCIDENT_LOCK_BEFORE_MS, t);
+    log(
+      `INCIDENT marked: ${n} past segment(s) locked, next ${INCIDENT_LOCK_AFTER_MS / 1000} s will be locked too`,
+      "warn"
+    );
+    await refreshSegments();
+  };
+
+  const toggleSim = () => {
+    const v = !simOffline;
+    setSimOffline(v);
+    txRef.current?.setSimulatedOffline(v);
+  };
+
+  // ── Recordings actions ─────────────────────────────────────────────────────
+  const chosen = segments.filter((s) => selected.has(s.key));
+
+  const toggleSel = (key: string) =>
+    setSelected((p) => {
+      const n = new Set(p);
+      if (n.has(key)) n.delete(key);
+      else n.add(key);
+      return n;
+    });
+
+  const downloadSelected = async () => {
+    for (const s of chosen) {
+      downloadBlob(s.blob, s.fileName);
+      await new Promise((r) => setTimeout(r, 400));
+    }
+  };
+
+  const uploadSelected = async () => {
+    setBusy("Uploading…");
+    try {
+      let i = 0;
+      for (const s of chosen) {
+        setBusy(`Uploading ${++i}/${chosen.length}…`);
+        await uploadEvidence(s.record.session_id, s.fileName, s.blob);
+        if (!s.locked) await setLocked(s.key, true);
+      }
+      log(`Submitted ${chosen.length} segment(s) to the insurer (evidence bucket) — locked locally`);
+      setSelected(new Set());
+      await refreshSegments();
+    } catch (e) {
+      log(`Upload failed: ${(e as Error).message}`, "error");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const wipe = async () => {
+    if (rec === "recording") return;
+    await clearRecordings();
+    setSelected(new Set());
+    setStats({ recorded: 0, sent: 0, purged: 0 });
+    log("All local recordings and pending hashes deleted", "warn");
+    await refreshSegments();
+    txRef.current?.kick();
+  };
+
+  const openPreview = (s: LocalSegment) => {
+    if (preview) URL.revokeObjectURL(preview.url);
+    setPreview({ url: URL.createObjectURL(s.blob), name: s.fileName });
+  };
+
+  // ── Derived ────────────────────────────────────────────────────────────────
+  const recording = rec === "recording";
+  const localBytes = segments.reduce((a, s) => a + s.blob.size, 0);
+  const linkBadge =
+    link === "online" ? (
+      <Badge tone="green" pulse={recording}>Uplink online</Badge>
+    ) : link === "simulated_offline" ? (
+      <Badge tone="amber" pulse>Network loss (simulated)</Badge>
+    ) : (
+      <Badge tone="red" pulse>Offline — buffering</Badge>
+    );
 
   return (
     <>
       <Head>
-        <title>Driver Unit — Video Fingerprint System</title>
-        <meta
-          name="description"
-          content="Upload a SHA-256 fingerprint file and stream it to the cloud in real-time."
-        />
+        <title>Dashcam Encoder</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+        <meta name="theme-color" content="#020617" />
       </Head>
 
-      <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white font-sans">
-        {/* ── Navigation bar ─────────────────────────────────────────────── */}
-        <nav className="border-b border-slate-700/50 bg-slate-900/70 backdrop-blur-md sticky top-0 z-10">
-          <div className="max-w-5xl mx-auto px-6 h-16 flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <span className="text-2xl">🎥</span>
-              <div>
-                <p className="text-xs text-slate-400 font-medium uppercase tracking-widest">
-                  Cloud Fingerprint System
-                </p>
-                <h1 className="text-sm font-bold text-white leading-tight">
-                  Driver / Dashcam Unit
-                </h1>
-              </div>
+      <div className="min-h-screen bg-slate-950 text-white">
+        <TopNav icon="🎥" kicker="Encoder / Transmitter" title="Driver Dashcam" href="/admin" hrefLabel="Decoder" />
+
+        <main className="max-w-6xl mx-auto px-4 py-5 space-y-5">
+          {!supabaseConfigured && <ConfigWarning />}
+          {initError && (
+            <div className="p-4 rounded-xl border border-red-500/40 bg-red-500/10 text-sm text-red-300">
+              Initialisation failed: {initError}
             </div>
-            <a
-              href="/admin"
-              className="flex items-center gap-2 text-sm text-slate-400 hover:text-white transition-colors duration-200 group"
-            >
-              <span>Admin Dashboard</span>
-              <span className="group-hover:translate-x-1 transition-transform duration-200">
-                →
+          )}
+
+          <div className="flex flex-wrap items-center gap-2">
+            {recording ? <Badge tone="red" pulse>REC</Badge> : <Badge tone="slate">{rec === "starting" ? "Starting…" : rec === "stopping" ? "Finalising…" : "Standby"}</Badge>}
+            {linkBadge}
+            {pending > 0 && <Badge tone="amber">{pending} hash(es) in outbox</Badge>}
+            {rejected > 0 && <Badge tone="red">{rejected} rejected</Badge>}
+            {identity && (
+              <span className="text-[11px] text-slate-500 font-mono ml-auto">
+                device {identity.deviceId.slice(0, 8)} · key {identity.fingerprint}
               </span>
-            </a>
+            )}
           </div>
-        </nav>
 
-        <main className="max-w-5xl mx-auto px-6 py-12 space-y-8">
-          {/* ── Status badge ───────────────────────────────────────────────── */}
-          <StatusBadge status={stream.status} />
-
-          {/* ── Upload card ────────────────────────────────────────────────── */}
-          <section className="bg-slate-800/60 border border-slate-700/50 rounded-2xl p-8 backdrop-blur-sm">
-            <h2 className="text-lg font-semibold text-white mb-1">
-              Step 1 — Upload Fingerprint File
-            </h2>
-            <p className="text-sm text-slate-400 mb-6">
-              Select a <code className="text-emerald-400">.txt</code> file
-              containing one SHA-256 hash per line.
-            </p>
-
-            <label
-              htmlFor="file-upload"
-              className="flex flex-col items-center justify-center w-full h-36 border-2 border-dashed border-slate-600 hover:border-emerald-500 rounded-xl cursor-pointer transition-colors duration-200 group"
-            >
-              <span className="text-3xl mb-2 group-hover:scale-110 transition-transform duration-200">
-                📁
-              </span>
-              <span className="text-sm text-slate-400 group-hover:text-white transition-colors duration-200">
-                {fileName ? (
-                  <>
-                    <span className="text-emerald-400 font-medium">
-                      {fileName}
-                    </span>{" "}
-                    — click to change
-                  </>
-                ) : (
-                  "Click to browse or drag & drop"
-                )}
-              </span>
-              <input
-                id="file-upload"
-                type="file"
-                accept=".txt,text/plain"
-                className="hidden"
-                onChange={handleFileChange}
-                disabled={stream.status === "streaming"}
-              />
-            </label>
-
-            {/* Parse report */}
-            {parseResult && (
-              <div className="mt-6 grid grid-cols-1 sm:grid-cols-3 gap-4">
-                <StatCard
-                  label="Valid Hashes"
-                  value={parseResult.hashes.length.toLocaleString()}
-                  color="emerald"
-                  icon="✅"
-                />
-                <StatCard
-                  label="Skipped Lines"
-                  value={parseResult.skippedLines.length.toLocaleString()}
-                  color={parseResult.skippedLines.length > 0 ? "amber" : "slate"}
-                  icon="⚠️"
-                />
-                <StatCard
-                  label="Stream Delay"
-                  value={`${STREAM_DELAY_MS} ms`}
-                  color="sky"
-                  icon="⏱️"
-                />
-              </div>
-            )}
-
-            {/* Skipped lines detail */}
-            {parseResult && parseResult.skippedLines.length > 0 && (
-              <details className="mt-4">
-                <summary className="text-sm text-amber-400 cursor-pointer hover:text-amber-300 transition-colors">
-                  Show {parseResult.skippedLines.length} skipped line
-                  {parseResult.skippedLines.length !== 1 ? "s" : ""}
-                </summary>
-                <div className="mt-3 max-h-40 overflow-y-auto rounded-lg bg-slate-900/60 border border-slate-700 p-3 space-y-1">
-                  {parseResult.skippedLines.map(({ lineNumber, raw, reason }) => (
-                    <p
-                      key={lineNumber}
-                      className="text-xs font-mono text-slate-400"
-                    >
-                      <span className="text-slate-500">Line {lineNumber}:</span>{" "}
-                      <span className="text-amber-400">&quot;{raw}&quot;</span>{" "}
-                      — {reason}
-                    </p>
-                  ))}
-                </div>
-              </details>
-            )}
-          </section>
-
-          {/* ── Streaming card ──────────────────────────────────────────────── */}
-          <section className="bg-slate-800/60 border border-slate-700/50 rounded-2xl p-8 backdrop-blur-sm">
-            <h2 className="text-lg font-semibold text-white mb-1">
-              Step 2 — Stream to Cloud
-            </h2>
-            <p className="text-sm text-slate-400 mb-6">
-              Each hash is inserted into Supabase individually, simulating a
-              continuous dashcam feed.
-            </p>
-
-            <div className="flex flex-wrap gap-3 mb-8">
-              <button
-                id="btn-start-streaming"
-                onClick={handleStartStreaming}
-                disabled={!canStream}
-                className="px-6 py-3 rounded-xl font-semibold text-sm bg-emerald-500 hover:bg-emerald-400 disabled:bg-slate-700 disabled:text-slate-500 disabled:cursor-not-allowed text-white transition-all duration-200 shadow-lg shadow-emerald-500/20 hover:shadow-emerald-500/40 disabled:shadow-none"
-              >
-                {stream.status === "streaming" ? (
-                  <span className="flex items-center gap-2">
-                    <span className="animate-pulse">●</span> Streaming…
-                  </span>
-                ) : stream.status === "done" ? (
-                  "▶ Stream Again"
-                ) : (
-                  "▶ Start Streaming"
-                )}
-              </button>
-
-              {stream.status === "streaming" && (
-                <button
-                  id="btn-stop-streaming"
-                  onClick={handleStop}
-                  className="px-6 py-3 rounded-xl font-semibold text-sm bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-500/30 transition-all duration-200"
-                >
-                  ■ Stop
-                </button>
-              )}
-            </div>
-
-            {/* Progress bar */}
-            {stream.total > 0 && (
-              <div className="space-y-3">
-                <div className="flex justify-between text-sm">
-                  <span className="text-slate-400">
-                    Sent{" "}
-                    <span className="text-white font-mono font-semibold">
-                      {stream.sent.toLocaleString()}
-                    </span>{" "}
-                    /{" "}
-                    <span className="text-slate-300 font-mono">
-                      {stream.total.toLocaleString()}
-                    </span>{" "}
-                    frames
-                  </span>
-                  <span className="text-slate-400">
-                    Elapsed:{" "}
-                    <span className="text-white font-mono">{elapsed}</span>
-                  </span>
-                </div>
-
-                <div className="w-full h-3 bg-slate-900 rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-gradient-to-r from-emerald-500 to-teal-400 rounded-full transition-all duration-300 ease-out"
-                    style={{ width: `${progressPercent}%` }}
-                  />
-                </div>
-
-                <p className="text-xs text-slate-500">
-                  {progressPercent}% complete
-                </p>
-
-                {/* Last transmitted hash */}
-                {stream.lastHash && (
-                  <div className="mt-4 p-3 rounded-lg bg-slate-900/60 border border-slate-700">
-                    <p className="text-xs text-slate-500 mb-1">
-                      Last transmitted hash
-                    </p>
-                    <p className="text-xs font-mono text-emerald-400 break-all">
-                      {stream.lastHash}
-                    </p>
+          <div className="grid lg:grid-cols-5 gap-5">
+            {/* ── Camera / composition ───────────────────────────────────── */}
+            <Card className="lg:col-span-3" title="Live road recording" subtitle="Camera frames are composed on a canvas (timestamp · ids · GPS overlay) and encoded into fixed-length segments.">
+              <div className="relative w-full aspect-video bg-black rounded-xl overflow-hidden border border-slate-700">
+                <canvas ref={canvasRef} className="w-full h-full object-contain" />
+                {!recording && (
+                  <div className="absolute inset-0 flex items-center justify-center text-slate-500 text-sm">
+                    {rec === "starting" ? "Opening camera…" : "Camera inactive"}
                   </div>
                 )}
               </div>
-            )}
+              {/* Source video element: must be in the DOM for iOS, kept invisible */}
+              <video ref={videoRef} playsInline muted className="absolute w-px h-px opacity-0 pointer-events-none" />
 
-            {/* Error message */}
-            {stream.status === "error" && stream.errorMessage && (
-              <div className="mt-4 p-4 rounded-lg bg-red-500/10 border border-red-500/30">
-                <p className="text-sm text-red-400 font-medium">
-                  ⚠ {stream.errorMessage}
+              <div className="flex flex-wrap gap-2 mt-4">
+                {!recording ? (
+                  <Button tone="success" onClick={start} disabled={!identity || rec === "starting" || rec === "stopping"}>
+                    ● Start dashcam
+                  </Button>
+                ) : (
+                  <Button tone="danger" onClick={stop}>■ Stop</Button>
+                )}
+                <Button tone="warn" onClick={incident} disabled={!recording} title="Lock the last 30 s and next 30 s of video">
+                  ⚠ Incident — lock clip
+                </Button>
+                <Button onClick={toggleSim} tone={simOffline ? "warn" : "slate"} title="Cut the uplink to demonstrate offline buffering">
+                  {simOffline ? "↺ Restore network" : "✈ Simulate network loss"}
+                </Button>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3 mt-4 text-xs">
+                <label className="flex flex-col gap-1 text-slate-400">
+                  Segment length
+                  <select
+                    value={segmentMs}
+                    disabled={recording}
+                    onChange={(e) => setSegmentMs(Number(e.target.value))}
+                    className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-2 text-slate-100"
+                  >
+                    {SEGMENT_OPTIONS_MS.map((v) => (
+                      <option key={v} value={v}>{v / 1000} s</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="flex flex-col gap-1 text-slate-400">
+                  Local retention (loop recording)
+                  <select
+                    value={retentionMs}
+                    onChange={(e) => setRetentionMs(Number(e.target.value))}
+                    className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-2 text-slate-100"
+                  >
+                    {RETENTION_OPTIONS_MS.map((v) => (
+                      <option key={v} value={v}>{v / 60000} min</option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+
+              {error && <p className="mt-3 text-sm text-red-400">⚠ {error}</p>}
+            </Card>
+
+            {/* ── Stats + last hash ─────────────────────────────────────── */}
+            <div className="lg:col-span-2 space-y-5">
+              <div className="grid grid-cols-2 gap-3">
+                <Stat label="Elapsed" value={startedAt ? formatElapsed(now - startedAt) : "—"} tone="indigo" />
+                <Stat label="Segments recorded" value={stats.recorded} tone="green" />
+                <Stat label="Hashes sent" value={stats.sent} tone="sky" />
+                <Stat label="Outbox (pending)" value={pending} tone={pending ? "amber" : "slate"} />
+                <Stat label="Stored on phone" value={segments.length} sub={formatBytes(localBytes)} />
+                <Stat label="Deleted (expired)" value={stats.purged} sub={`after ${retentionMs / 60000} min`} />
+              </div>
+              {storage && storage.quota > 0 && (
+                <p className="text-[11px] text-slate-500">
+                  Browser storage: {formatBytes(storage.usage)} used of {formatBytes(storage.quota)}
                 </p>
+              )}
+
+              <Card title="Last segment fingerprint">
+                {last ? (
+                  <dl className="text-[11px] font-mono space-y-1.5 break-all">
+                    <Row k="seq" v={`#${last.seq} · ${formatClock(last.started_at)} → ${formatClock(last.ended_at)}`} />
+                    <Row k="segment_hash" v={last.segment_hash} color="text-emerald-400" />
+                    <Row k="prev_chain" v={last.prev_chain_hash} />
+                    <Row k="chain_hash" v={last.chain_hash} color="text-sky-400" />
+                    <Row k="signature" v={short(last.signature, 44)} />
+                  </dl>
+                ) : (
+                  <p className="text-xs text-slate-500">No segment yet — start recording.</p>
+                )}
+              </Card>
+            </div>
+          </div>
+
+          {/* ── Local recordings ─────────────────────────────────────────── */}
+          <Card
+            title={`Recordings on this phone (${segments.length})`}
+            subtitle="Unlocked segments are deleted automatically when older than the retention period. Locked segments are kept for a claim."
+            right={
+              <div className="flex flex-wrap gap-2">
+                <Button small onClick={() => setSelected(new Set(segments.filter((s) => s.locked).map((s) => s.key)))}>
+                  Select locked
+                </Button>
+                <Button small onClick={downloadSelected} disabled={!chosen.length}>⬇ Download ({chosen.length})</Button>
+                <Button small tone="primary" onClick={uploadSelected} disabled={!chosen.length || !!busy}>
+                  {busy ?? `☁ Send to insurer (${chosen.length})`}
+                </Button>
+                <Button small tone="danger" onClick={wipe} disabled={recording}>Wipe</Button>
+              </div>
+            }
+          >
+            {preview && (
+              <div className="mb-4">
+                <video src={preview.url} controls autoPlay className="w-full max-w-xl rounded-lg border border-slate-700 bg-black" />
+                <p className="text-[11px] text-slate-500 mt-1 font-mono">{preview.name}</p>
               </div>
             )}
+            <div className="overflow-x-auto max-h-[45vh] overflow-y-auto">
+              <table className="w-full text-xs">
+                <thead className="text-slate-500 text-left sticky top-0 bg-slate-900">
+                  <tr>
+                    <th className="p-2"></th>
+                    <th className="p-2">Seq</th>
+                    <th className="p-2">Time</th>
+                    <th className="p-2">Size</th>
+                    <th className="p-2 hidden sm:table-cell">SHA-256</th>
+                    <th className="p-2">Hash</th>
+                    <th className="p-2">Retention</th>
+                    <th className="p-2 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800">
+                  {[...segments].reverse().map((s) => {
+                    const expiresIn = s.record.ended_at + retentionMs - now;
+                    return (
+                      <tr key={s.key} className={s.locked ? "bg-amber-500/5" : ""}>
+                        <td className="p-2">
+                          <input type="checkbox" checked={selected.has(s.key)} onChange={() => toggleSel(s.key)} />
+                        </td>
+                        <td className="p-2 font-mono">
+                          #{s.record.seq}
+                          <span className="text-slate-600"> {s.record.session_id.slice(0, 4)}</span>
+                        </td>
+                        <td className="p-2 font-mono text-slate-400">{formatClock(s.record.started_at)}</td>
+                        <td className="p-2 font-mono text-slate-400">{formatBytes(s.blob.size)}</td>
+                        <td className="p-2 font-mono text-slate-500 hidden sm:table-cell">{short(s.record.segment_hash, 16)}</td>
+                        <td className="p-2">{s.sent ? <Badge tone="green">sent</Badge> : <Badge tone="amber">queued</Badge>}</td>
+                        <td className="p-2">
+                          <button onClick={async () => { await setLocked(s.key, !s.locked); await refreshSegments(); }} className="text-left">
+                            {s.locked ? <Badge tone="amber">🔒 locked</Badge> : <span className="font-mono text-slate-400">{expiresIn > 0 ? `${Math.ceil(expiresIn / 1000)} s` : "expiring"}</span>}
+                          </button>
+                        </td>
+                        <td className="p-2 text-right whitespace-nowrap space-x-1">
+                          <Button small onClick={() => openPreview(s)}>▶</Button>
+                          <Button small onClick={() => downloadBlob(s.blob, s.fileName)}>⬇</Button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {!segments.length && (
+                    <tr>
+                      <td colSpan={8} className="p-6 text-center text-slate-500">No recordings stored.</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </Card>
 
-            {/* Done message + navigate button */}
-            {stream.status === "done" && (
-              <div className="mt-4 space-y-3">
-                <div className="p-4 rounded-lg bg-emerald-500/10 border border-emerald-500/30">
-                  <p className="text-sm text-emerald-400 font-medium">
-                    ✓ All {stream.sent.toLocaleString()} frames successfully
-                    transmitted in {elapsed}.
-                  </p>
-                </div>
-                <a
-                  id="btn-view-admin"
-                  href="/admin"
-                  className="flex items-center justify-center gap-2 w-full sm:w-auto px-6 py-3 rounded-xl font-semibold text-sm bg-indigo-500 hover:bg-indigo-400 text-white transition-all duration-200 shadow-lg shadow-indigo-500/20 hover:shadow-indigo-500/40"
-                >
-                  🛡️ View Admin Dashboard
-                  <span className="text-indigo-200">→</span>
-                </a>
-              </div>
-            )}
-
-          </section>
+          {/* ── Event log ────────────────────────────────────────────────── */}
+          <Card title="Event log">
+            <div className="max-h-56 overflow-y-auto font-mono text-[11px] space-y-0.5">
+              {logs.map((l, i) => (
+                <p key={i} className={l.level === "error" ? "text-red-400" : l.level === "warn" ? "text-amber-300" : "text-slate-400"}>
+                  <span className="text-slate-600">{formatClock(l.t)}</span> {l.msg}
+                </p>
+              ))}
+              {!logs.length && <p className="text-slate-600">—</p>}
+            </div>
+          </Card>
         </main>
       </div>
     </>
   );
 }
 
-// ── Sub-components ─────────────────────────────────────────────────────────────
-
-function StatusBadge({ status }: { status: StreamStatus }) {
-  const map: Record<StreamStatus, { label: string; classes: string; dot: string }> = {
-    idle: {
-      label: "Ready",
-      classes: "bg-slate-700/50 text-slate-400 border-slate-600",
-      dot: "bg-slate-400",
-    },
-    streaming: {
-      label: "Transmitting",
-      classes: "bg-emerald-500/10 text-emerald-400 border-emerald-500/30",
-      dot: "bg-emerald-400 animate-pulse",
-    },
-    done: {
-      label: "Complete",
-      classes: "bg-teal-500/10 text-teal-400 border-teal-500/30",
-      dot: "bg-teal-400",
-    },
-    error: {
-      label: "Error",
-      classes: "bg-red-500/10 text-red-400 border-red-500/30",
-      dot: "bg-red-400",
-    },
-  };
-
-  const { label, classes, dot } = map[status];
-
+function Row({ k, v, color = "text-slate-300" }: { k: string; v: string; color?: string }) {
   return (
-    <div
-      className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-full border text-xs font-medium ${classes}`}
-    >
-      <span className={`w-2 h-2 rounded-full ${dot}`} />
-      {label}
+    <div>
+      <dt className="text-slate-500">{k}</dt>
+      <dd className={color}>{v}</dd>
     </div>
   );
-}
-
-function StatCard({
-  label,
-  value,
-  color,
-  icon,
-}: {
-  label: string;
-  value: string;
-  color: "emerald" | "amber" | "sky" | "slate";
-  icon: string;
-}) {
-  const colorMap = {
-    emerald: "text-emerald-400",
-    amber: "text-amber-400",
-    sky: "text-sky-400",
-    slate: "text-slate-400",
-  };
-
-  return (
-    <div className="bg-slate-900/60 border border-slate-700 rounded-xl p-4">
-      <p className="text-xs text-slate-500 mb-1 flex items-center gap-1.5">
-        <span>{icon}</span>
-        {label}
-      </p>
-      <p className={`text-2xl font-bold font-mono ${colorMap[color]}`}>
-        {value}
-      </p>
-    </div>
-  );
-}
-
-// ── Helpers ────────────────────────────────────────────────────────────────────
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
