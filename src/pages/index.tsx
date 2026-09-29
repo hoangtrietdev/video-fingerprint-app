@@ -271,7 +271,7 @@ export default function EncoderPage() {
       </Head>
 
       <div className="min-h-screen bg-slate-950 text-white">
-        <TopNav icon="🎥" kicker="Encoder / Transmitter" title="Driver Dashcam" href="/admin" hrefLabel="Decoder" />
+        <TopNav icon="🎥" kicker="Encoder / Transmitter" title="Driver Dashcam" href="/admin" hrefLabel="Decoder" right={<a href="/demo" className="text-xs text-slate-400 hover:text-white whitespace-nowrap">Fraud Demo →</a>} />
 
         <main className="max-w-6xl mx-auto px-4 py-5 space-y-5">
           {!supabaseConfigured && <ConfigWarning />}

@@ -48,7 +48,7 @@ export default function DecoderPage() {
         <meta name="viewport" content="width=device-width, initial-scale=1" />
       </Head>
       <div className="min-h-screen bg-slate-950 text-white">
-        <TopNav icon="🛡️" kicker="Insurer · Decoder" title="Evidence Integrity Console" href="/" hrefLabel="Encoder" />
+        <TopNav icon="🛡️" kicker="Insurer · Decoder" title="Evidence Integrity Console" href="/" hrefLabel="Encoder" right={<a href="/demo" className="text-xs text-slate-400 hover:text-white whitespace-nowrap">Fraud Demo →</a>} />
         <main className="max-w-6xl mx-auto px-4 py-5 space-y-5">
           {!supabaseConfigured && <ConfigWarning />}
           <div className="flex gap-2 border-b border-slate-800 pb-2 overflow-x-auto">
