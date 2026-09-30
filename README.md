@@ -8,6 +8,7 @@ that it has not been modified, cut or forged.
 |---|---|---|---|
 | **Encoder / Transmitter** | driver's smartphone (mobile web app) | `/` | [docs/ENCODER.md](docs/ENCODER.md) |
 | **Decoder** | insurer's computer (web app) | `/admin` | [docs/DECODER.md](docs/DECODER.md) |
+| **Evaluation Dashboard** | any browser | `/evaluation` | [docs/EVALUATION.md](docs/EVALUATION.md) |
 | Installation / configuration / run (both) | | | [docs/SETUP.md](docs/SETUP.md) |
 
 
@@ -48,6 +49,12 @@ incident → clip uploaded ─────────────────�
 | Network interruptions | persistent outbox, back-off, idempotent inserts, simulate button |
 | Deletion of expired data | loop recording `src/lib/retention.ts`; server purge `purge_expired_segments()` |
 | Integrity verification + detection | `src/lib/verifier.ts`, Decoder "Verify evidence" + tamper lab |
+| Perceptual hash metrics (aHash/dHash/pHash/wHash) | `src/lib/fingerprintMetrics.ts` |
+| Fuzzy hashing (ssdeep, TLSH) | `src/lib/fingerprintMetrics.ts` |
+| Vector metrics (L1, L2, cosine) | `src/lib/fingerprintMetrics.ts` |
+| Threshold evaluation (precision/recall/F1) | `src/lib/fingerprintMetrics.ts` + `/evaluation` |
+| Evaluation dashboard (all §1–§7 scenarios) | `src/pages/evaluation.tsx` — `/evaluation` |
+| Evaluation report | [docs/EVALUATION.md](docs/EVALUATION.md) |
 | Environment reproduction | `docs/SETUP.md` |
 
 ## Project structure
@@ -56,6 +63,7 @@ incident → clip uploaded ─────────────────�
 supabase/schema.sql        tables, triggers (server time, immutability), RLS, purge, bucket, realtime
 src/lib/config.ts          tunable parameters
 src/lib/integrity.ts       protocol shared by both apps (SHA-256, canonical record, chain, ECDSA)
+src/lib/fingerprintMetrics.ts perceptual hashes, fuzzy hashes, vector metrics, threshold evaluation
 src/lib/recorder.ts        Encoder: camera → composition → segments → hash/sign → store
 src/lib/transmitter.ts     Encoder: store-and-forward hash transmission
 src/lib/retention.ts       Encoder: loop recording, incident lock
@@ -66,7 +74,9 @@ src/lib/repository.ts      Decoder: Supabase queries, evidence bucket
 src/lib/tamperLab.ts       Decoder: tampering simulations for the demo
 src/pages/index.tsx        Encoder UI
 src/pages/admin.tsx        Decoder UI
+src/pages/evaluation.tsx   Evaluation dashboard (§1–§7 scenarios + metrics + thresholds)
 scripts/selftest.ts        automated tests of the protocol and the verifier
+docs/EVALUATION.md         comprehensive evaluation report
 ```
 
 ## Open-source components
